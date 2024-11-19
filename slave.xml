@@ -1,0 +1,14 @@
+<?xml version='1.1' encoding='UTF-8'?>
+<slave>
+  <name>slave-node-1</name>
+  <description>Jenkins Slave Node 1</description>
+  <remoteFS>/home/jenkins</remoteFS>
+  <numExecutors>2</numExecutors>
+  <mode>EXCLUSIVE</mode>
+  <launcher class="hudson.slaves.JNLPLauncher">
+    <webSocket>false</webSocket>
+  </launcher>
+  <label>slave</label>
+  <nodeProperties/>
+</slave>
+

@@ -1,0 +1,174 @@
+- name: Setup Docker Swarm Cluster
+  hosts: all_nodes
+  become: yes
+  tasks:
+    - name: Install required packages
+      apt:
+        name: "{{ item }}"
+        state: present
+        update_cache: yes
+      loop:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        - software-properties-common
+        - openjdk-17-jre-headless
+
+    - name: Add Docker GPG key
+      shell: curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu focal stable"
+        state: present
+
+    - name: Install Docker and Docker Compose
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - docker-ce
+        - docker-ce-cli
+        - containerd.io
+
+- name: Configure Master Node
+  hosts: master-node
+  become: true
+  vars_files:
+   - secrets.yml
+  tasks:
+
+    # Initialize Docker Swarm on Master
+    - name: Initialize Docker Swarm
+      command: docker swarm init --advertise-addr enp0s8
+      register: swarm_init
+      ignore_errors: yes
+
+    # Obtain Join Command for Worker Nodes
+    - name: Get Docker Swarm join token
+      command: docker swarm join-token -q worker
+      register: join_token
+      tags: 
+        - join_swarm
+
+   
+    - name: Set join token globally
+      set_fact:
+        worker_join_token: "{{ join_token.stdout }}"
+      delegate_to: localhost
+      run_once: true
+      tags:
+        - join_swarm
+
+
+    # Create an overlay network for Jenkins
+    - name: Create Jenkins overlay network
+      command: docker network create --driver overlay jenkins-overlay-network
+      ignore_errors: yes
+
+    # Copy Jenkins Master Compose file to the Master Node
+    - name: Copy Jenkins Master Compose file
+      copy:
+        src: ./jenkins-master-compose.yml
+        dest: /home/vagrant/jenkins-master-compose.yml
+
+
+    # Deploy Jenkins Master using Docker Compose
+    - name: Deploy Jenkins Master
+      command: docker stack deploy -c /home/vagrant/jenkins-master-compose.yml jenkins
+
+    # Wait for Jenkins to start
+    - name: Wait for Jenkins to start
+      wait_for:
+        port: 8080
+        delay: 20
+        timeout: 180
+
+    # Download Jenkins CLI
+    - name: Download Jenkins CLI
+      command: wget http://localhost:8080/jnlpJars/jenkins-cli.jar
+      args:
+        chdir: /home/vagrant
+    - name: Get Jenkins Master Container ID
+      command: sudo  docker ps -q --filter "name=jenkins-master"
+      register: jenkins_master_container_id
+      changed_when: false
+
+
+    # Copy recommended plugins file to the Master Node
+    - name: Copy Recommended Plugins file
+      copy:
+        src: ./recommended-plugins.txt
+        dest: /home/vagrant/recommended-plugins.txt
+
+    # Install plugins from recommended-plugins.txt
+    - name: Install Jenkins plugins
+      command: java -jar jenkins-cli.jar -s http://localhost:8080/ -auth admin:artem install-plugin ldap 
+      args:
+        chdir: /home/vagrant
+      ignore_errors: yes
+
+    # Wait for Jenkins to start
+    - name: Wait for Jenkins to start
+      wait_for:
+        port: 8080
+        delay: 20
+        timeout: 120
+
+    - name: Generate slave.xml
+      template:
+        src: slave.xml
+        dest: /home/vagrant/slave.xml
+
+    - name: Create Jenkins slave node
+      shell: "cat /home/vagrant/slave.xml | java -jar /home/vagrant/jenkins-cli.jar -s http://localhost:8080/ -auth admin:artem create-node"
+      ignore_errors: yes
+      args:
+        chdir: /home/vagrant
+
+
+
+    - name: Copy Groovy script to master node
+      copy:
+        src: get-agent-secret.groovy
+        dest: /home/vagrant/get-agent-secret.groovy
+
+
+    - name: Execute Groovy script to get agent secret
+      shell: "cat /home/vagrant/get-agent-secret.groovy | java -jar /home/vagrant/jenkins-cli.jar -s http://localhost:8080/ -auth admin:artem groovy ="
+      args:
+        chdir: /home/vagrant
+      register: groovy_output
+      ignore_errors: yes
+
+    - name: Set agent secret variable
+      set_fact:
+        agent_secret: "{{ groovy_output.stdout }}"
+
+
+
+
+- name: Configure Worker Nodes
+  hosts: worker-node-1
+  vars_files:
+   - secrets.yml
+  become: true
+  tasks:
+
+    - name: Join Docker Swarm
+      command: "docker swarm join --token {{ hostvars['master-node'].worker_join_token }} '{{ master_ip }}':2377"
+      ignore_errors: yes
+      tags: 
+        - join_swarm   
+
+    - name: Copy Jenkins Slave Compose file
+      copy:
+        src: ./jenkins-slave-compose.yml
+        dest: /home/vagrant/jenkins-slave-compose.yml
+
+
+    - name: Start Jenkins slave using Docker Compose
+      command: docker compose up -d
+      args:
+        chdir: /home/vagrant
+      become: true 
